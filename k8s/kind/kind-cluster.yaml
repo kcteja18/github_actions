@@ -1,0 +1,38 @@
+# Local kind cluster for the observability walkthrough (docs/OBSERVABILITY.md).
+#
+# This is a laptop-only cluster. It has nothing to do with the EKS cluster the
+# GitHub Actions pipeline builds — the manifests in k8s/ target EKS and are left
+# untouched; the kind-specific overrides live beside this file.
+#
+# Create with:
+#   kind create cluster --name ness-obs --config k8s/kind/kind-cluster.yaml
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+name: ness-obs
+
+nodes:
+  # One control-plane plus two workers. The extra workers exist so node-exporter
+  # runs as a real DaemonSet across multiple nodes, which is the thing worth
+  # seeing in Prometheus. A single-node cluster works too but makes every
+  # per-node query collapse to one series.
+  - role: control-plane
+    # extraPortMappings publish a container port on the Windows host directly,
+    # so the NodePort services below are reachable at http://localhost:<port>
+    # without any kubectl port-forward. Port-forward still works and is what the
+    # runbook uses for Prometheus/Grafana; these mappings are the durable path
+    # that survives closing your PowerShell window.
+    extraPortMappings:
+      - containerPort: 30000  # Prometheus  -> http://localhost:9090
+        hostPort: 9090
+        protocol: TCP
+      - containerPort: 31000  # Grafana     -> http://localhost:3000
+        hostPort: 3000
+        protocol: TCP
+      - containerPort: 32000  # Alertmanager-> http://localhost:9093
+        hostPort: 9093
+        protocol: TCP
+      - containerPort: 31446  # Chatbot     -> http://localhost:8501
+        hostPort: 8501
+        protocol: TCP
+  - role: worker
+  - role: worker

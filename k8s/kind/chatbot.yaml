@@ -1,0 +1,98 @@
+# Chatbot Deployment + NodePort Service for the local kind cluster.
+#
+# Why this file exists instead of reusing k8s/deployment.yaml directly:
+#   - k8s/deployment.yaml carries image: PIPELINE_IMAGE, a placeholder the deploy
+#     workflow renders at run time. Applying it unrendered fails to pull.
+#   - k8s/service.yaml is type LoadBalancer, which never gets an external IP on
+#     kind (no cloud controller), so it would sit <pending> forever.
+# Keeping a separate overlay means the EKS pipeline manifests stay untouched.
+#
+# Set the image below to your Docker Hub image before applying, or override it:
+#   kubectl set image deployment/it-support-chatbot chatbot=<user>/it-support-chatbot:<tag> -n it-support
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: it-support-chatbot
+  labels:
+    app: it-support-chatbot
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app: it-support-chatbot
+  template:
+    metadata:
+      labels:
+        app: it-support-chatbot
+    spec:
+      containers:
+        - name: chatbot
+          # The pipeline pushes both :latest and an immutable short-SHA tag;
+          # prefer the SHA tag (e.g. :ae78a7c) when you want to pin exactly
+          # what you are observing.
+          image: vijaynvb/it-support-chatbot:latest
+          # Always pull so :latest actually refreshes. kind caches images in each
+          # node's containerd, and IfNotPresent would pin you to a stale layer.
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8501
+          # config.py validate_config() raises at startup when these are absent,
+          # so the pod CrashLoopBackOffs without a valid secret. Create it first:
+          #   kubectl create secret generic aws-credentials -n it-support \
+          #     --from-literal=AWS_ACCESS_KEY_ID=... \
+          #     --from-literal=AWS_SECRET_ACCESS_KEY=... \
+          #     --from-literal=AWS_DEFAULT_REGION=us-east-1
+          envFrom:
+            - secretRef:
+                name: aws-credentials
+          # Lower than the EKS manifest's requests. kind nodes share your Docker
+          # Desktop memory budget with the whole Prometheus stack, so the app
+          # asks for less here to leave headroom.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 768Mi
+          # First boot embeds the knowledge base through Bedrock, which is slow.
+          # The startup probe absorbs that before liveness starts enforcing.
+          startupProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+---
+# NodePort 31446 is mapped to host port 8501 by kind-cluster.yaml, so this is
+# reachable at http://localhost:8501 with no port-forward running.
+apiVersion: v1
+kind: Service
+metadata:
+  name: it-support-chatbot
+  labels:
+    app: it-support-chatbot
+spec:
+  type: NodePort
+  selector:
+    app: it-support-chatbot
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8501
+      nodePort: 31446
+      protocol: TCP

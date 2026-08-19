@@ -1,0 +1,21 @@
+# Alternative to service.yaml with no load balancer cost. Reachable at
+# http://<node-public-ip>:31446 — nodes run in public subnets, so this works,
+# but you must open port 31446 in the node security group first.
+#
+# Applying both this and service.yaml is fine (different names, same selector).
+apiVersion: v1
+kind: Service
+metadata:
+  name: it-support-chatbot-nodeport
+  labels:
+    app: it-support-chatbot
+spec:
+  type: NodePort
+  selector:
+    app: it-support-chatbot
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8501
+      nodePort: 31446
+      protocol: TCP

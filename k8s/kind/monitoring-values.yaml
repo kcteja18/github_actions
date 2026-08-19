@@ -1,0 +1,123 @@
+# Helm values for kube-prometheus-stack on the local kind cluster.
+#
+#   helm install monitoring prometheus-community/kube-prometheus-stack \
+#     --namespace monitoring --create-namespace \
+#     -f k8s/kind/monitoring-values.yaml --timeout 15m
+#
+# Using a values file instead of a dozen --set flags keeps the install
+# reproducible and reviewable — you can diff it, and `helm upgrade` with the
+# same file is idempotent.
+#
+# The NodePorts here line up with the extraPortMappings in kind-cluster.yaml:
+#   30000 -> localhost:9090   31000 -> localhost:3000   32000 -> localhost:9093
+
+prometheus:
+  service:
+    type: NodePort
+    nodePort: 30000
+  prometheusSpec:
+    # 6h/2Gi caps disk on a laptop cluster. The default 10d retention fills the
+    # kind node's ephemeral storage surprisingly fast on Docker Desktop.
+    retention: 6h
+    retentionSize: 2GB
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        memory: 1536Mi
+    # Scrape every ServiceMonitor in the cluster, not just ones carrying this
+    # release's Helm labels. Without this, a ServiceMonitor you write by hand is
+    # silently ignored — a classic "why is my target missing" trap.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+grafana:
+  service:
+    type: NodePort
+    nodePort: 31000
+  # Matches the chart default that the tutorial quotes. Fine for localhost;
+  # never do this on anything reachable from outside your machine.
+  adminPassword: prom-operator
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  # Dashboards are provisioned from grafana.com by ID at install time, so the
+  # cluster view is populated without clicking through the import UI.
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: ''
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+  dashboards:
+    default:
+      # Node Exporter Full — per-node CPU, memory, disk, network.
+      node-exporter-full:
+        gnetId: 1860
+        revision: 37
+        datasource: Prometheus
+      # Kubernetes cluster monitoring — pod/namespace level resource usage.
+      k8s-cluster:
+        gnetId: 315
+        revision: 3
+        datasource: Prometheus
+
+alertmanager:
+  service:
+    type: NodePort
+    nodePort: 32000
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 25m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 192Mi
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 384Mi
+
+# kind runs its control plane as static pods inside a Docker container, and these
+# components bind to addresses Prometheus cannot reach from a pod network. Left
+# enabled, they show as permanently DOWN targets in Status -> Targets, which
+# looks like a broken install but is purely a kind artifact.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false

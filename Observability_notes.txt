@@ -1,0 +1,38 @@
+1. Observability:
+    Monitor applications - IT-Chatbot
+    Monitor infrastructure - 
+        1. EC2
+        2. EKS 
+    management 
+    alert -> email, sms, jira
+    Logging: errors
+
+1. Application should support observability: 
+    1. logging feature -> file + centeralized 
+    2. health monitoring feature 
+        1. fast api application 
+            /health
+            /memory, cpu, network
+
+2. Infrastructure: k8s
+    1. how many nodes 
+    2. how many pods are their 
+    3. what kind of communication happening 
+
+3. Tools: 
+    1. Prometheus [queries] + Grafana [UI Dashboard] : Open Source
+    2. Splunk, Fluentd 
+
+4. HELM Tool-> packages the k8s object and gives you as a reusable application 
+    deploy application on k8s: 
+        1. objects of k8s -> namespace, deployment, service, volume, configmap [env], secrets [api]
+        2. pacakge and distribure -> Helm charts
+
+Hands On: 
+    1. docker desktop -> cluster - one node
+    2. aws eks -> master [managed node] nodes [2] 
+    3. kind -> cluster -> 2 node on a dev system 
+        1. container runtime engine [docker]
+    4. microk8s
+    5. minikube
+    6. Kubeadmin

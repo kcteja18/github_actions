@@ -1,0 +1,18 @@
+# Public entrypoint. Provisions an AWS Classic Load Balancer (billed hourly —
+# delete the Service before tearing down the cluster, or the ELB is orphaned).
+# For a zero-ELB-cost alternative, use nodeportsvc.yaml instead.
+apiVersion: v1
+kind: Service
+metadata:
+  name: it-support-chatbot
+  labels:
+    app: it-support-chatbot
+spec:
+  type: LoadBalancer
+  selector:
+    app: it-support-chatbot
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8501
+      protocol: TCP
