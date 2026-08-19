@@ -1,0 +1,55 @@
+# create a workflow with manual trigger to run on ubuntu latest  and checkout the code install python 3.11 and and build the artifact and upload it to the workflow artifacts
+name: Basic CI
+on:
+  workflow_dispatch: # manual trigger
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Build artifact
+        run: |
+          mkdir -p dist
+          cp *.py dist/
+          cp requirements.txt readme.md dockerfile it_sector.txt dist/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-artifact
+          path: dist
+  
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+    - name: Download web-app content
+      uses: actions/download-artifact@v4
+      with:
+        name: my-artifact
+           
+    - name: View content
+      run: ls -R
+
+    - name: Archive site content
+      uses: thedoctor0/zip-release@master
+      with:
+        filename: app.zip
+
+    - name: Create GitHub release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.run_number }}
+        name: Release ${{ github.run_number }}
+        files: ./app.zip
