@@ -1,0 +1,555 @@
+# Test the app, then four layers of security scanning:
+#   SAST       - Bandit + Semgrep + SonarCloud on the Python source
+#   SCA        - Snyk + pip-audit on requirements.txt
+#   CONTAINER  - Hadolint (Dockerfile), Trivy + Grype (image CVEs), Dockle
+#                (image hygiene), Trivy config/secret scans, SBOM
+#   DAST       - OWASP ZAP baseline against the app running in a container
+#
+# Ported from the Java/Maven reference pipeline. Maven+Sonar becomes pip+Bandit,
+# snyk/actions/maven becomes snyk/actions/python, and the ZAP job boots the app
+# locally instead of pointing at a fixed public URL.
+#
+# The image is built exactly once (build_image) and passed to the scan and DAST
+# jobs as an artifact, so every stage scans the identical bits that get deployed.
+name: Security Scans (SAST, SCA, Container, DAST)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fail_on_critical:
+        description: 'Fail the build on CRITICAL image vulnerabilities'
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Weekly re-scan: new CVEs land against an unchanged image all the time.
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+  security-events: write   # required to upload SARIF to the Security tab
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.11'
+  APP_PORT: '8501'
+  IMAGE_NAME: it-support-chatbot
+  IMAGE_TAG: scan-${{ github.sha }}
+  # Pinned explicitly: the action's default has pointed at a deleted
+  # Trivy release before, which fails the install and every scan after it.
+  TRIVY_VERSION: v0.70.0
+
+jobs:
+  # ---------------------------------------------------------------- TEST ----
+  test:
+    runs-on: ubuntu-latest
+    name: Unit tests (Python ${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 matches the deployment target; 3.12 is an early warning for
+        # upstream breakage before the base image moves.
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      # The suite mocks Bedrock/Chroma throughout, so it needs no AWS creds.
+      - name: Run unit tests with coverage
+        run: |
+          pytest -q \
+            --junitxml=test-results-${{ matrix.python-version }}.xml \
+            --cov=. \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-config=.coveragerc
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: |
+            test-results-${{ matrix.python-version }}.xml
+            coverage.xml
+          retention-days: 30
+
+      # Coverage from the target version only — the matrix would otherwise
+      # upload two conflicting reports for the same commit.
+      - name: Upload coverage artifact
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 30
+
+      - name: Publish test summary
+        if: always()
+        uses: test-summary/action@v2
+        with:
+          paths: test-results-${{ matrix.python-version }}.xml
+          show: 'fail, skip'
+
+  # ---------------------------------------------------------------- SAST ----
+  sast:
+    runs-on: ubuntu-latest
+    needs: test
+    name: SAST scan on the source code
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # SonarCloud needs full history to attribute issues to authors/branches.
+          fetch-depth: 0
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install scanners
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit[sarif] semgrep
+
+      # Bandit is the Python SAST engine. It never fails the build directly —
+      # findings land in the Security tab so they can be triaged, not ignored.
+      - name: Run Bandit SAST scan
+        # tests/ is excluded: its dummy AWS values are fixtures, not real
+        # secrets, and would otherwise dominate the report as B105/B106.
+        run: bandit -r . -f sarif -o bandit.sarif --exit-zero --exclude ./dist,./terraform,./k8s,./tests
+
+      - name: Upload Bandit results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('bandit.sarif') != ''
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+
+      # Semgrep adds cross-cutting rules Bandit does not carry, notably the
+      # LLM/prompt-injection and secrets rulesets relevant to this app.
+      - name: Run Semgrep SAST scan
+        run: |
+          semgrep scan \
+            --config=p/python \
+            --config=p/security-audit \
+            --config=p/secrets \
+            --sarif --output=semgrep.sarif \
+            --exclude=tests --exclude=terraform --exclude=k8s \
+            || true
+
+      - name: Upload Semgrep results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('semgrep.sarif') != ''
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      # Skipped automatically when SONAR_TOKEN is not configured, so the rest of
+      # the pipeline still runs on forks and on repos without SonarCloud set up.
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: coverage-report
+
+      # REQUIRES A ONE-TIME SONARCLOUD SETTING:
+      #   Project → Administration → Analysis Method → turn OFF "Automatic Analysis".
+      # SonarCloud refuses to accept a CI analysis while Automatic Analysis is
+      # enabled ("You are running CI analysis while Automatic Analysis is
+      # enabled") and exits 3. The scanner enforces this server-side; no action
+      # input can override it. continue-on-error keeps it from blocking the
+      # pipeline until the setting is switched off — remove that flag afterwards
+      # so genuine Sonar failures surface again.
+      #
+      # v4 self-reports as unsupported and carrying a known vulnerability; v8 is
+      # the current line and takes the same args/projectBaseDir inputs.
+      - name: Run Sonar analysis with SonarCloud
+        if: env.SONAR_TOKEN != ''
+        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@v8.2.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          # sonar.sources and sonar.tests must be disjoint — with sources=.
+          # the tests/ dir gets claimed by both and indexing fails outright
+          # ("can't be indexed twice"). tests/** is excluded from sources and
+          # declared only via sonar.tests.
+          args: >
+            -Dsonar.projectKey=PadmanabhanSaravanan_SecurityScan_Ness
+            -Dsonar.organization=padmanabhansaravanan
+            -Dsonar.sources=.
+            -Dsonar.tests=tests
+            -Dsonar.exclusions=terraform/**,k8s/**,dist/**,tests/**,.venv*/**
+            -Dsonar.test.inclusions=tests/**
+            -Dsonar.python.version=3.11
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+
+  # ----------------------------------------------------------------- SCA ----
+  sca:
+    runs-on: ubuntu-latest
+    needs: test
+    name: SCA scan on dependencies
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # continue-on-error mirrors the reference pipeline: dependency CVEs are
+      # reported, but a transitive CVE with no fix available should not wedge
+      # every build until upstream ships a patch.
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/python-3.10@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=requirements.txt --package-manager=pip --sarif-file-output=snyk.sarif
+
+      - name: Upload Snyk results
+        uses: github/codeql-action/upload-sarif@v4
+        if: hashFiles('snyk.sarif') != ''
+        with:
+          sarif_file: snyk.sarif
+          category: snyk
+
+      # pip-audit needs no account, so dependency CVEs are still caught on forks
+      # and whenever SNYK_TOKEN is absent.
+      - name: Run pip-audit
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt --desc --format=markdown --output=pip-audit.md || true
+          {
+            echo "### pip-audit (dependency CVEs)"
+            cat pip-audit.md 2>/dev/null || echo "No findings reported."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload pip-audit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-report
+          path: pip-audit.md
+          retention-days: 30
+
+  # --------------------------------------------------------- BUILD IMAGE ----
+  # Built once, scanned and DAST-tested everywhere else. Rebuilding per job
+  # risks scanning bits that differ from what actually gets deployed.
+  build_image:
+    runs-on: ubuntu-latest
+    needs: test
+    name: Build container image
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image to a tarball
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./dockerfile
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          outputs: type=docker,dest=/tmp/image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # ----------------------------------------------------------- CONTAINER ----
+  container_scan:
+    runs-on: ubuntu-latest
+    needs: build_image
+    name: Container image and Dockerfile scanning
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Dockerfile linting: catches issues before they reach an image ---
+      - name: Lint Dockerfile with Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        continue-on-error: true
+        with:
+          dockerfile: ./dockerfile
+          format: sarif
+          output-file: hadolint.sarif
+          no-fail: true
+
+      - name: Upload Hadolint results
+        uses: github/codeql-action/upload-sarif@v4
+        if: hashFiles('hadolint.sarif') != ''
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint
+
+      # --- Load the exact image the other jobs use ---
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: /tmp
+
+      - name: Load image
+        run: |
+          docker load --input /tmp/image.tar
+          docker image ls "$IMAGE_NAME"
+
+      # --- CVE scanning: two engines, different vulnerability databases ---
+      - name: Trivy image scan (SARIF for Security tab)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      - name: Upload Trivy image results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-image.sarif') != ''
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      # Human-readable table in the job summary — the SARIF upload is for
+      # triage, this is for whoever is looking at the failed run right now.
+      - name: Trivy image scan (table for summary)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: table
+          output: trivy-image.txt
+          severity: MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Publish Trivy summary
+        if: always()
+        run: |
+          {
+            echo "### Trivy image scan"
+            echo '```'
+            head -c 60000 trivy-image.txt 2>/dev/null || echo "No output."
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Grype's DB frequently differs from Trivy's; running both meaningfully
+      # widens coverage for the same image.
+      - name: Grype image scan
+        uses: anchore/scan-action@v7
+        id: grype
+        continue-on-error: true
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          output-format: sarif
+          severity-cutoff: high
+          fail-build: false
+
+      - name: Upload Grype results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && steps.grype.outputs.sarif != ''
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+          category: grype
+
+      # --- Image hygiene: CIS benchmark checks, not CVEs ---
+      # Flags the things this Dockerfile actually gets wrong: running as root,
+      # no HEALTHCHECK, no pinned versions.
+      - name: Dockle image hygiene scan
+        uses: erzz/dockle-action@v1
+        continue-on-error: true
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          report-format: sarif
+          report-name: dockle
+          failure-threshold: fatal
+          exit-code: '0'
+
+      - name: Upload Dockle results
+        uses: github/codeql-action/upload-sarif@v4
+        if: hashFiles('dockle.sarif') != ''
+        with:
+          sarif_file: dockle.sarif
+          category: dockle
+
+      # --- Misconfiguration and secret scanning ---
+      # Covers the Dockerfile and the k8s manifests: privileged containers,
+      # missing resource limits, absent securityContext.
+      - name: Trivy config scan (IaC misconfiguration)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-config.sarif
+          severity: MEDIUM,HIGH,CRITICAL
+
+      - name: Upload Trivy config results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-config.sarif') != ''
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+      # Catches credentials baked into an image layer — the failure mode that
+      # matters most here, since the app consumes AWS keys via env.
+      - name: Trivy secret scan on image filesystem
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          scanners: secret
+          format: table
+          output: trivy-secrets.txt
+          exit-code: '0'
+
+      - name: Publish secret scan summary
+        if: always()
+        run: |
+          {
+            echo "### Trivy secret scan"
+            echo '```'
+            head -c 20000 trivy-secrets.txt 2>/dev/null || echo "No output."
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # --- SBOM: required for incident response ("are we affected by X?") ---
+      - name: Generate SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 90
+
+      # --- Optional gate ---
+      # Off by default so a fresh CVE cannot block an unrelated hotfix; opt in
+      # per-run via the workflow_dispatch input.
+      - name: Fail on CRITICAL vulnerabilities
+        if: inputs.fail_on_critical
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # ---------------------------------------------------------------- DAST ----
+  zap_scan:
+    runs-on: ubuntu-latest
+    needs: [sca, container_scan]
+    name: DAST scan on the running web application
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: /tmp
+
+      - name: Load image
+        run: docker load --input /tmp/image.tar
+
+      # The app talks to AWS Bedrock at query time, but the Streamlit UI serves
+      # without credentials — enough surface for a baseline passive scan.
+      - name: Start application
+        run: |
+          docker run -d --name chatbot-dast \
+            -p ${APP_PORT}:${APP_PORT} \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            "${IMAGE_NAME}:${IMAGE_TAG}"
+
+      - name: Wait for application to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf "http://localhost:${APP_PORT}/_stcore/health" >/dev/null; then
+              echo "App is up after ${i} attempt(s)."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::App did not become healthy within 150s."
+          docker logs chatbot-dast
+          exit 1
+
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: 'http://localhost:8501'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+          allow_issue_writing: false
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs chatbot-dast || true
+
+      - name: Stop application
+        if: always()
+        run: docker rm -f chatbot-dast || true
+
+  # -------------------------------------------------------------- REPORT ----
+  security_summary:
+    runs-on: ubuntu-latest
+    needs: [test, sast, sca, container_scan, zap_scan]
+    if: always()
+    name: Security scan summary
+    steps:
+      - name: Aggregate job results
+        run: |
+          {
+            echo "## Security pipeline results"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Unit tests | ${{ needs.test.result }} |"
+            echo "| SAST (Bandit, Semgrep, Sonar) | ${{ needs.sast.result }} |"
+            echo "| SCA (Snyk, pip-audit) | ${{ needs.sca.result }} |"
+            echo "| Container (Trivy, Grype, Dockle, Hadolint) | ${{ needs.container_scan.result }} |"
+            echo "| DAST (ZAP) | ${{ needs.zap_scan.result }} |"
+            echo ""
+            echo "Detailed findings: **Security → Code scanning alerts**."
+          } >> "$GITHUB_STEP_SUMMARY"
